@@ -82,6 +82,7 @@ Goals — a `Goal` is `proc(s: State): Stream`:
 | `fresh` / `fresh2` / `fresh3` / `fresh4` | introduce fresh logic variables |
 | `branchMostConstrained(vars)` | fail-first search: branch on the unbound variable with the smallest current domain |
 | `computeDomain(v, s)` | current domain of a variable, derived from the constraint store |
+| `tabled(args, body)` | opt-in variant tabling; `args` declares a relation call's logical terms |
 
 Search — the stream is explicit data, processed by an explicit
 worklist, so interleaving cannot overflow the call stack:
@@ -101,9 +102,15 @@ directly.
 
 ## What it is not
 
-- **No tabling.** Repeated subgoals are re-solved; there is no
-  memoisation of answers, and left-recursive relations can diverge
-  the way they do in untabled miniKanren.
+- **Tabling is opt-in.** Wrap a relation body as `tabled(@[x, y], body)`
+  and include all of the relation's logical arguments in the list. Calls
+  with the same variant share answers, including left-recursive calls.
+  Untabled relations retain the ordinary worklist behavior. Two
+  properties of the tabled call: it saturates eagerly — the full answer
+  set for the variant is computed before any answer is returned, so
+  only table relations whose queried variant has finitely many answers —
+  and the body must not depend on state outside its declared args,
+  since saturation runs under the first call's state.
 - **No constraint solver** beyond `=/=` and `setEqo`. There is no
   finite-domain arithmetic, no linear constraints, no SMT backend.
   `computeDomain` / `branchMostConstrained` derive a domain from the

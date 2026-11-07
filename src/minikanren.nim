@@ -10,7 +10,7 @@
 ## (`raven6941/eponym`, `src/experimental/relational/minikanren.nim`).
 ## No Eponym dependency remains: the only import is stdlib `strutils`.
 ##
-## This is a library, not a framework: there is no tabling, no
+## This is a library, not a framework: tabling is opt-in through `tabled`, no
 ## constraint solver beyond `=/=` and `setEqo`, and no staging. See
 ## README.md for what it is and is not.
 
@@ -515,6 +515,145 @@ proc take*(n: int, s: Stream): seq[State] =
       let forced = cur.thunk()
       worklist.add(forced)
 
+# --- Variant tabling --------------------------------------------------
+#
+# A tabled relation declares the terms that make up its logical call:
+#
+#   proc path(x, y: RTerm): Goal =
+#     tabled(@[x, y], conde([... path(x, z) ...]))
+#
+# The declaration is necessary because Nim closures do not expose their
+# captured values.  Calls are keyed by those terms after walk, with all
+# variables renamed to first occurrence order.  Answers are projected back
+# onto the declared terms, so recursive calls can consume answers already
+# found for the same variant.  Saturation is iterative: a recursive call
+# never recursively evaluates its own producer, which keeps left recursion
+# off the Nim call stack.
+
+type
+  TableAnswer = seq[RTerm]
+  TableEntry = ref object
+    key: string
+    args: seq[RTerm]
+    input: State
+    body: Goal
+    answers: seq[TableAnswer]
+    active: bool
+  TableContext = ref object
+    entries: seq[TableEntry]
+
+var currentTableContext: TableContext = nil
+
+proc canonicalTerm(t: RTerm, s: Subst, vars: var seq[int]): RTerm =
+  let w = walk(t, s)
+  case w.kind
+  of rkVar:
+    var idx = -1
+    for i, id in vars:
+      if id == w.id:
+        idx = i
+        break
+    if idx < 0:
+      vars.add(w.id)
+      idx = vars.high
+    rvar(idx)
+  of rkAtom: ratom(w.name)
+  of rkPair: rpair(canonicalTerm(w.head, s, vars),
+                   canonicalTerm(w.tail, s, vars))
+
+proc variantKey(args: seq[RTerm], s: State): string =
+  var vars: seq[int] = @[]
+  result = ""
+  for arg in args:
+    result.add($canonicalTerm(arg, s.subst, vars))
+    result.add("|")
+
+proc projectAnswer(args: seq[RTerm], s: State): TableAnswer =
+  var vars: seq[int] = @[]
+  result = @[]
+  for arg in args:
+    result.add(canonicalTerm(arg, s.subst, vars))
+
+proc instantiate(t: RTerm, vars: var seq[(int, RTerm)]): RTerm =
+  case t.kind
+  of rkVar:
+    for (id, value) in vars:
+      if id == t.id:
+        return value
+    let value = freshVar()
+    vars.add((t.id, value))
+    value
+  of rkAtom: ratom(t.name)
+  of rkPair: rpair(instantiate(t.head, vars), instantiate(t.tail, vars))
+
+proc replayAnswer(entry: TableEntry, callArgs: seq[RTerm],
+                  answer: TableAnswer, s: State): Stream =
+  var subst = s.subst
+  var vars: seq[(int, RTerm)] = @[]
+  for i, arg in callArgs:
+    let value = instantiate(answer[i], vars)
+    let (ok, next) = unify(arg, value, subst)
+    if not ok:
+      return emptyStream()
+    subst = next
+  var state = State(subst: subst, diseqs: s.diseqs, seteqs: s.seteqs)
+  if not checkDiseqs(state): return emptyStream()
+  let (ok, propagated) = propagateSetEqs(state)
+  if not ok or not checkDiseqs(propagated): return emptyStream()
+  singleton(propagated)
+
+proc saturate(entry: TableEntry) =
+  if entry.active: return
+  entry.active = true
+  while true:
+    let before = entry.answers.len
+    # The explicit worklist remains the only search driver.  Recursive
+    # calls see the answers accumulated by earlier rounds.
+    for state in take(100000, entry.body(entry.input)):
+      let answer = projectAnswer(entry.args, state)
+      var seen = false
+      for old in entry.answers:
+        if old.len == answer.len:
+          var same = true
+          for i in 0..<old.len:
+            if $old[i] != $answer[i]:
+              same = false
+              break
+          if same:
+            seen = true
+            break
+      if not seen:
+        entry.answers.add(answer)
+    if entry.answers.len == before: break
+  entry.active = false
+
+proc tableAnswers(entry: TableEntry, callArgs: seq[RTerm], s: State): Stream =
+  var streamResult = emptyStream()
+  for i in countdown(entry.answers.high, 0):
+    streamResult = mplus(replayAnswer(entry, callArgs, entry.answers[i], s), streamResult)
+  streamResult
+
+proc tabled*(args: seq[RTerm], body: Goal): Goal =
+  ## Opt-in variant tabling for one relation call. `args` must contain all
+  ## logical inputs/outputs whose variants should share a table entry.
+  return proc(s: State): Stream =
+    if currentTableContext.isNil:
+      return body(s)  # usable outside run, with ordinary semantics
+    let key = variantKey(args, s)
+    var entry: TableEntry = nil
+    for candidate in currentTableContext.entries:
+      if candidate.key == key:
+        entry = candidate
+        break
+    if entry.isNil:
+      entry = TableEntry(key: key, args: args, input: s, body: body,
+                         answers: @[], active: false)
+      currentTableContext.entries.add(entry)
+      saturate(entry)
+    elif not entry.active:
+      saturate(entry)
+    tableAnswers(entry, args, s)
+
 # --- Reify and Run ----------------------------------------------------
 
 proc reify*(t: RTerm, s: State): RTerm =
@@ -533,11 +672,16 @@ proc run*(q: RTerm, g: Goal, n = 10): seq[RTerm] =
   ## continues monotonically to avoid ID collisions.
   result = @[]
   var seen: seq[string] = @[]
-  let stream = g(emptyState())
-  for s in take(n, stream):
-    let t = reify(q, s)
-    let key = $t
-    if key notin seen:
-      seen.add(key)
-      result.add(t)
-      if result.len >= n: return
+  let previous = currentTableContext
+  currentTableContext = TableContext(entries: @[])
+  try:
+    let stream = g(emptyState())
+    for s in take(n, stream):
+      let t = reify(q, s)
+      let key = $t
+      if key notin seen:
+        seen.add(key)
+        result.add(t)
+        if result.len >= n: return
+  finally:
+    currentTableContext = previous
