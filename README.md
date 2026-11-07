@@ -109,9 +109,11 @@ directly.
   `computeDomain` / `branchMostConstrained` derive a domain from the
   `setEqo` / `=/=` store only — enough for small CSPs (e.g. Sudoku),
   not a general FD solver.
-- **No staging.** Relations are interpreted by the worklist at
-  runtime. If you need a staged/compiled relational program, that is
-  a different library.
+- **No staging — yet.** Relations are interpreted by the worklist at
+  runtime, and the library currently has no staging dependency. A
+  staged/compiled relational program is the staging library's job
+  ([raven6941/staging](https://github.com/raven6941/staging)), and this
+  engine may depend on it eventually; for now it stands alone.
 - **No logic-variable scoping beyond `fresh`.** Fresh variables come
   from one process-global counter (`freshCounter`), which `run` never
   resets. Do not expect fresh ids to restart between runs, and do not
