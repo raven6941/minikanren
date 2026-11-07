@@ -1,0 +1,6 @@
+# Compiled test binaries (extensionless) and Nim caches.
+nimcache/
+tests/test_minikanren
+tests/test_examples
+tests/pbt_minikanren
+*.exe
